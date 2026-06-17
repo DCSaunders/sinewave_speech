@@ -276,33 +276,83 @@ def formants_from_lsp(lsps, sr):
     bws = -0.5 * np.minimum((2 * np.pi) - abs(diff), abs(diff)) * fr    
     return freqs, bws
 
-def sinethesise(wave, frame_len, order, sr=44100, use_lsp=False, noise=1.0, overlap=None, bw_amp=40.0):
+def match_tracks(prev, cur):
+    """Match the current frame's formant frequencies to the previous frame's
+    per-track frequencies so that each output track keeps following the same
+    formant across frames (even when the frequency-sorted order swaps).
+
+    prev, cur: equal-length sequences of frequencies (one entry per band).
+    Returns `assign` where assign[track] is the index into `cur` for that track.
+    Greedy nearest-frequency matching; fine for the handful of bands involved.
+    """
+    K = len(cur)
+    pairs = sorted((abs(prev[tr] - cur[fi]), tr, fi)
+                   for tr in range(K) for fi in range(K))
+    assign = [None] * K
+    track_taken = [False] * K
+    form_taken = [False] * K
+    for _, tr, fi in pairs:
+        if not track_taken[tr] and not form_taken[fi]:
+            assign[tr] = fi
+            track_taken[tr] = True
+            form_taken[fi] = True
+    return assign
+
+
+def sinethesise(wave, frame_len, order, sr=44100, use_lsp=False, noise=1.0, overlap=None, bw_amp=40.0, separate=False):
+    """Resynthesise sinewave speech.
+
+    If separate is False, returns the combined waveform (one array).
+    If separate is True, returns (combined, stems) where stems is a list of
+    n_bands waveforms, one per sliding tone, that sum exactly to combined.
+    Continuity tracking keeps each stem following a single formant.
+    """
     overlap = overlap or 0.5
     frame_overlap = int(frame_len * overlap)
     times, lsps, env_rms = get_lsp(wave, frame_len, order, sr, frame_overlap)
-   
+
     formants, formant_bw = formants_from_lsp(lsps, sr)
+    n_bands = formants.shape[1]
 
     synthesize = np.zeros_like(wave)
+    stems = [np.zeros_like(wave) for _ in range(n_bands)] if separate else None
+    prev = None
     window = scipy.signal.windows.hann(frame_len)
     t = np.arange(0.0, frame_len)
-    k = 0    
+    k = 0
     for i in range(0, len(wave), frame_overlap):
 
         if len(synthesize[i : i + frame_len]) == frame_len:
             # noise component
             syn_slice = np.zeros_like(t)
+            # per-band windowed contribution, kept only when separating
+            contrib = [] if separate else None
 
             # resonances
-            for band in range(formants.shape[1]):
+            for band in range(n_bands):
                 freq = formants[k, band]
                 bw = formant_bw[k, band]
-                amp = np.exp(bw/bw_amp)  # weight sines by inverse bandwidth                
+                amp = np.exp(bw/bw_amp)  # weight sines by inverse bandwidth
                 if freq>90.0:
-                    syn_slice += np.sin(freq * (t + i) / (sr / (2 * np.pi))) * amp
+                    tone = np.sin(freq * (t + i) / (sr / (2 * np.pi))) * amp
+                else:
+                    tone = np.zeros_like(t)
+                syn_slice += tone
+                if separate:
+                    contrib.append(window * tone * env_rms[k])
 
             synthesize[i : i + frame_len] += window * syn_slice * env_rms[k]
+
+            if separate:
+                # route each band's contribution to the track following it
+                cur = formants[k]
+                assign = match_tracks(prev, cur) if prev is not None else list(range(n_bands))
+                prev = [cur[assign[tr]] for tr in range(n_bands)]
+                for tr in range(n_bands):
+                    stems[tr][i : i + frame_len] += contrib[assign[tr]]
         k += 1
+    if separate:
+        return synthesize, stems
     return synthesize
 
 def sinethesise_alternative(wave, frame_len, order, sr=44100, use_lsp=False, noise=1.0, overlap=None):
@@ -435,6 +485,9 @@ def main(args):
     parser.add_argument(
         "--overlap", "-l", help="Window overlap, as fraction of the window length. Default 0.25", default=0.25, type=float,
     )
+    parser.add_argument(
+        "--separate", help="Also write each sliding tone to its own <output>_toneN.wav (sine mode only).", action="store_true",
+    )
 
     args = parser.parse_args(args[1:])
 
@@ -457,9 +510,9 @@ def main(args):
         wav, args.low, args.high, fs, decimate=args.decimate
     ))
     order = 2 * args.order + 2
+    stems = None
     if args.sine:
-        
-            modulated = sinethesise(
+            result = sinethesise(
                 wav_filtered,
                 frame_len=args.window,
                 order=order,
@@ -467,8 +520,10 @@ def main(args):
                 bw_amp=args.bw_amp,
                 sr=fs / args.decimate,
                 noise=0.0,
-                overlap=args.overlap
+                overlap=args.overlap,
+                separate=args.separate,
             )
+            modulated, stems = result if args.separate else (result, None)
     if args.buzz or args.noise:
 
         if args.buzz:
@@ -492,10 +547,23 @@ def main(args):
         
 
     # un-decimate, normalize and write out
-    up_modulated = normalize(upsample(modulated, args.decimate))
-    
+    up = upsample(modulated, args.decimate)
+    scale = 0.5 / np.max(up)            # same scaling normalize() would apply
+    up_modulated = up * scale
     scipy.io.wavfile.write(output_path, fs, (up_modulated*32767.0).astype(np.int16))
     print(f"Wrote {output_path}")
+
+    if args.separate and stems is not None:
+        # write each sliding tone, using the SAME scale so the stems still
+        # sum to the combined output
+        base, ext = os.path.splitext(str(output_path))
+        for tr, stem in enumerate(stems):
+            up_stem = upsample(stem, args.decimate) * scale
+            stem_path = f"{base}_tone{tr}{ext}"
+            scipy.io.wavfile.write(stem_path, fs, (up_stem*32767.0).astype(np.int16))
+            print(f"Wrote {stem_path}")
+    elif args.separate:
+        print("--separate only applies to sine mode; no tone files written.")
 
 
 if __name__ == "__main__":

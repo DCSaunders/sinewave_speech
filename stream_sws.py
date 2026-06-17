@@ -12,6 +12,7 @@
 ## building blocks that streaming needs (a causal bandpass+decimator and a
 ## causal normaliser) plus a block-driven vocoder and a sounddevice driver.
 
+import os
 import sys
 import argparse
 
@@ -23,7 +24,7 @@ from scipy.signal.windows import hann
 import sounddevice as sd
 
 # Reused as-is from the offline implementation.
-from sws import lpc, lpc_to_lsp, formants_from_lsp
+from sws import lpc, lpc_to_lsp, formants_from_lsp, match_tracks
 
 
 # ----------------------------------------------------------------------------
@@ -128,7 +129,7 @@ class StreamingVocoder:
     """
 
     def __init__(self, mode, frame_len, order, fs, decimate, overlap, bw_amp,
-                 buzz=None, residual=0.0):
+                 buzz=None, residual=0.0, separate=False):
         self.mode = mode  # 'sine' | 'buzz' | 'noise'
         self.frame_len = frame_len  # decimated samples (== --window)
         self.order = order
@@ -140,31 +141,39 @@ class StreamingVocoder:
         self.buzz = buzz
         self.residual = residual
 
+        # per-tone stems are only meaningful for sine mode
+        self.separate = bool(separate) and mode == "sine"
+        # number of accumulator channels: one per sliding tone, else just one
+        self.n_ch = (order // 2) if self.separate else 1
+        self.prev = None           # previous per-track frequencies (tracking)
+        self.last_stems = None     # (n_ch, m) stems produced by the last call
+
         # sine renders at full rate, buzz/noise at decimated rate
         self.acc_up = decimate if mode == "sine" else 1
         self.win = hann(frame_len * self.acc_up)
         self.upsampler = (StreamingUpsampler(decimate)
                           if (self.acc_up == 1 and decimate > 1) else None)
 
-        self.inbuf = np.zeros(0)   # decimated input
-        self.consumed = 0          # absolute decimated index of next frame start
-        self.acc = np.zeros(0)     # overlap-add accumulator (acc-rate samples)
-        self.acc_base = 0          # absolute acc-rate index of acc[0]
-        self.emitted_upto = 0      # absolute acc-rate index already emitted
+        self.inbuf = np.zeros(0)             # decimated input
+        self.consumed = 0                    # absolute decimated index of next frame start
+        self.acc = np.zeros((self.n_ch, 0))  # multi-channel overlap-add accumulator
+        self.acc_base = 0                    # absolute acc-rate index of acc[:, 0]
+        self.emitted_upto = 0                # absolute acc-rate index already emitted
 
     # -- per-frame synthesis -------------------------------------------------
 
-    def _synth_sine(self, freqs, bws, rms, s):
+    def _synth_sine_bands(self, freqs, bws, rms, s):
+        """Per-band sine tones (one row each), full rate, before windowing."""
         n = self.frame_len * self.decimate
         t = np.arange(n)
         g_full = s * self.decimate
         fr = self.fs / (2 * np.pi)
-        syn = np.zeros(n)
-        for band in range(len(freqs)):
-            f, bw = freqs[band], bws[band]
+        bands = np.zeros((len(freqs), n))
+        for b in range(len(freqs)):
+            f, bw = freqs[b], bws[b]
             if f > 90.0:
-                syn += np.sin(f * (t + g_full) / fr) * np.exp(bw / self.bw_amp)
-        return syn * rms
+                bands[b] = np.sin(f * (t + g_full) / fr) * np.exp(bw / self.bw_amp) * rms
+        return bands
 
     def _synth_vocode(self, a, e, rms, s):
         n = self.frame_len
@@ -203,43 +212,64 @@ class StreamingVocoder:
         return out
 
     def _frame(self, s):
+        """Return a windowed frame of shape (n_ch, frame_len*acc_up)."""
         frame = self.inbuf[: self.frame_len]
         rms = np.sqrt(np.mean(frame ** 2))
+        n = self.frame_len * self.acc_up
         # silent frame: autocorrelation is all-zero and LPC is undefined, so
         # emit a silent (windowed) frame rather than letting Levinson reject it
         if rms < 1e-9:
-            return np.zeros(self.frame_len * self.acc_up)
+            return np.zeros((self.n_ch, n))
         a, e, _ = lpc(frame, self.order)
         if self.mode == "sine":
             lsp = lpc_to_lsp(a)
             freqs, bws = formants_from_lsp(lsp[None, :, :], self.sr_dec)
-            syn = self._synth_sine(freqs[0], bws[0], rms, s)
+            freqs, bws = freqs[0], bws[0]
+            bands = self._synth_sine_bands(freqs, bws, rms, s)  # (n_bands, n)
+            if self.separate:
+                # route each band to the track following that formant
+                assign = (match_tracks(self.prev, freqs)
+                          if self.prev is not None else list(range(len(freqs))))
+                self.prev = [freqs[assign[tr]] for tr in range(len(freqs))]
+                rows = bands[[assign[tr] for tr in range(self.n_ch)]]
+                return rows * self.win   # (n_ch, n), Hann-windowed
+            syn = bands.sum(axis=0)
         else:
             syn = self._synth_vocode(a, e, rms, s)
         # Hann window for click-free overlap-add (matches sws.py)
-        return syn * self.win
+        return (syn * self.win)[None, :]   # (1, n)
 
     # -- overlap-add accumulator ---------------------------------------------
 
     def _add(self, start, syn):
-        end = start + len(syn)
-        need = end - self.acc_base
-        if need > len(self.acc):
-            self.acc = np.concatenate([self.acc, np.zeros(need - len(self.acc))])
+        # syn: (n_ch, m)
+        m = syn.shape[1]
+        need = (start + m) - self.acc_base
+        if need > self.acc.shape[1]:
+            pad = np.zeros((self.n_ch, need - self.acc.shape[1]))
+            self.acc = np.concatenate([self.acc, pad], axis=1)
         off = start - self.acc_base
-        self.acc[off:off + len(syn)] += syn
+        self.acc[:, off:off + m] += syn
 
     def _emit(self, flush_to):
         a = self.emitted_upto - self.acc_base
-        b = min(flush_to - self.acc_base, len(self.acc))
+        b = min(flush_to - self.acc_base, self.acc.shape[1])
         if b <= a:
-            return np.zeros(0)
-        out = self.acc[a:b].copy()
+            return np.zeros((self.n_ch, 0))
+        out = self.acc[:, a:b].copy()
         self.emitted_upto = self.acc_base + b
         # trim the front of the accumulator to bound memory
-        self.acc = self.acc[b:]
+        self.acc = self.acc[:, b:]
         self.acc_base = self.emitted_upto
         return out
+
+    def _finish(self, multi):
+        """Sum channels for playback; stash per-tone stems if separating."""
+        combined = multi.sum(axis=0)
+        if self.upsampler is not None:
+            combined = self.upsampler.process(combined)
+        self.last_stems = multi if self.separate else None
+        return combined
 
     # -- public API ----------------------------------------------------------
 
@@ -254,15 +284,15 @@ class StreamingVocoder:
             self.consumed += self.hop
             # samples before (s + hop) receive no further contributions
             emitted = self._emit(self.consumed * self.acc_up)
-            if len(emitted):
+            if emitted.shape[1]:
                 chunks.append(emitted)
-        out = np.concatenate(chunks) if chunks else np.zeros(0)
-        return self.upsampler.process(out) if self.upsampler else out
+        multi = (np.concatenate(chunks, axis=1) if chunks
+                 else np.zeros((self.n_ch, 0)))
+        return self._finish(multi)
 
     def flush(self):
         """Emit any remaining buffered output (call at shutdown)."""
-        out = self._emit(self.acc_base + len(self.acc))
-        return self.upsampler.process(out) if self.upsampler else out
+        return self._finish(self._emit(self.acc_base + self.acc.shape[1]))
 
 
 # ----------------------------------------------------------------------------
@@ -284,10 +314,11 @@ def run(args):
     vocoder = StreamingVocoder(
         mode, frame_len=args.window, order=order, fs=fs, decimate=args.decimate,
         overlap=args.overlap, bw_amp=args.bw_amp, buzz=args.buzz, residual=args.residual,
+        separate=args.separate,
     )
     normalizer = StreamingNormalizer(fs, target=args.target)
 
-    mic_rec, sws_rec = [], []
+    mic_rec, sws_rec, stem_list = [], [], []
     outq = np.zeros(0)
 
     print(f"Streaming: mode={mode}, fs={fs}, blocksize={B} "
@@ -296,8 +327,12 @@ def run(args):
         print(f"Running for {args.duration:.1f} s.")
     if args.write:
         print(f"● REC ON  -> {args.mic_out} (mic) + {args.sws_out} (sinewave)")
+        if vocoder.separate:
+            print(f"           + {vocoder.n_ch} per-tone files (<sws-out>_toneN.wav)")
     else:
         print("○ recording OFF (--no-write): monitoring only, no files written")
+    if args.separate and not vocoder.separate:
+        print("note: --separate only applies to sine mode; no tone files will be written")
 
     stream = sd.Stream(samplerate=fs, blocksize=B, channels=1, dtype="float32",
                        device=args.device, latency="high")
@@ -325,6 +360,9 @@ def run(args):
                 if args.write:
                     mic_rec.append(mono.copy())
                     sws_rec.append(play.copy())
+                    if vocoder.separate and vocoder.last_stems is not None \
+                            and vocoder.last_stems.shape[1]:
+                        stem_list.append(vocoder.last_stems)
                 frames_done += B
 
                 # live status line, overwritten in place each block
@@ -341,8 +379,19 @@ def run(args):
             tail = normalizer.process(vocoder.flush())
             if len(tail):
                 sws_rec.append(tail)
+            if vocoder.separate and vocoder.last_stems is not None \
+                    and vocoder.last_stems.shape[1]:
+                stem_list.append(vocoder.last_stems)
             _write_wav(args.mic_out, fs, np.concatenate(mic_rec) if mic_rec else np.zeros(0))
             _write_wav(args.sws_out, fs, np.concatenate(sws_rec) if sws_rec else np.zeros(0))
+            if vocoder.separate and stem_list:
+                stems = np.concatenate(stem_list, axis=1)         # (n_ch, total)
+                # one global scale (offline-style) so the tones sum to a
+                # normalised combined signal
+                scale = 0.5 / max(np.max(stems.sum(axis=0)), 1e-9)
+                base, ext = os.path.splitext(args.sws_out)
+                for tr in range(stems.shape[0]):
+                    _write_wav(f"{base}_tone{tr}{ext}", fs, stems[tr] * scale)
         else:
             print("Stopped.")
 
@@ -367,6 +416,7 @@ def main(argv):
     parser.add_argument("--buzz", "-b", default=None, help="Resynthesise using a buzz at the given frequency (Hz).")
     parser.add_argument("--residual", type=float, default=0.0, help="Residual noise added in buzz mode. Default 0.0.")
     parser.add_argument("--noise", "-n", action="store_true", help="Resynthesise using filtered white noise.")
+    parser.add_argument("--separate", action="store_true", help="Also write each sliding tone to its own <sws-out>_toneN.wav (sine mode only).")
     # streaming-specific
     parser.add_argument("--samplerate", type=int, default=44100, help="Audio device sample rate. Default 44100.")
     parser.add_argument("--blocksize", type=int, default=2048, help="Audio block size (rounded up to a multiple of --decimate). Default 2048.")
