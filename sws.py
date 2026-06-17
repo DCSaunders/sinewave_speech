@@ -88,7 +88,11 @@ def levinson_1d(r, order):
 
 
 def lsp_to_lpc(lsp):
-    """Convert line spectral pairs to LPC"""
+    """Convert LSP (line spectral pairs) to LPC (Linear Predictive Codes)"""
+    # from wikipedia: "By construction, P is a palindromic polynomial and
+    # Q an antipalindromic polynomial; physically P(z) corresponds to the vocal
+    # tract with the glottis closed and Q(z) with the glottis open."
+
     ps = np.concatenate((lsp[:, 0], -lsp[::-1, 0], [np.pi]))
     qs = np.concatenate((lsp[:, 1], [0], -lsp[::-1, 1]))
 
@@ -191,7 +195,7 @@ def lpc_vocode(
     """
 
     # precompute the hamming window
-    window = scipy.signal.hann(frame_len)
+    window = scipy.signal.windows.hann(frame_len)
     t = np.arange(frame_len)
     # allocate the array for the output
     vocode = np.zeros(len(wave + frame_len))
@@ -280,7 +284,7 @@ def sinethesise(wave, frame_len, order, sr=44100, use_lsp=False, noise=1.0, over
     formants, formant_bw = formants_from_lsp(lsps, sr)
 
     synthesize = np.zeros_like(wave)
-    window = scipy.signal.hann(frame_len)
+    window = scipy.signal.windows.hann(frame_len)
     t = np.arange(0.0, frame_len)
     k = 0    
     for i in range(0, len(wave), frame_overlap):
